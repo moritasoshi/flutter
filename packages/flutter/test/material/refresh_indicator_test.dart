@@ -1272,8 +1272,11 @@ void main() {
   });
 
   // Regression test for https://github.com/flutter/flutter/issues/147363.
-  // The refresh distance should be based on the indicator's render size, not the inner viewport.
-  testWidgets('RefreshIndicator uses render size in NestedScrollView', (WidgetTester tester) async {
+  // When RefreshIndicator wraps a NestedScrollView with large headers, the
+  // inner scrollable's viewportDimension is very small, causing overly
+  // sensitive refresh triggering. The threshold should be based on the
+  // NestedScrollView's render size instead.
+  testWidgets('RefreshIndicator uses NestedScrollView render size for threshold', (WidgetTester tester) async {
     refreshCalled = false;
     tester.view.physicalSize = const Size(300.0, 600.0);
     tester.view.devicePixelRatio = 1.0;
@@ -1318,17 +1321,98 @@ void main() {
       ),
     );
 
-    final double indicatorHeight = tester.getSize(find.byType(RefreshIndicator)).height;
-    final double threshold = indicatorHeight * 0.25;
-    // The threshold is based on RefreshIndicator's render size, not the inner body viewport.
-    // A small drag of 15px should NOT trigger refresh.
+    final double nsvHeight = tester.getSize(find.byType(NestedScrollView)).height;
+    final double threshold = nsvHeight * 0.25;
+    // The threshold should be based on the NestedScrollView's render size (600px),
+    // not the compressed inner viewport (50px). A small drag should NOT trigger.
     await tester.fling(find.text('Large Header'), const Offset(0.0, 15.0), 1000.0);
     await tester.pumpAndSettle();
     expect(refreshCalled, false);
 
-    // A drag meeting the render-size-based threshold should trigger refresh.
+    // A drag meeting the NestedScrollView-based threshold should trigger refresh.
     refreshCalled = false;
     await tester.fling(find.text('Large Header'), Offset(0.0, threshold), 1000.0);
+    await tester.pumpAndSettle();
+    expect(refreshCalled, true);
+  });
+
+  // Verifies that the NestedScrollView-specific fix does not affect nested
+  // scrollables that are NOT inside a NestedScrollView.
+  testWidgets('RefreshIndicator uses viewportDimension for non-NestedScrollView nested case', (WidgetTester tester) async {
+    refreshCalled = false;
+    tester.view.physicalSize = const Size(300.0, 600.0);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    // CustomScrollView with a nested ListView inside a SliverToBoxAdapter.
+    // The inner ListView has depth=1 at RefreshIndicator but no NestedScrollView.
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RefreshIndicator(
+          onRefresh: refresh,
+          notificationPredicate: (ScrollNotification notification) => notification.depth == 1,
+          child: CustomScrollView(
+            slivers: <Widget>[
+              SliverToBoxAdapter(
+                child: SizedBox(
+                  height: 300.0,
+                  child: ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    children: <String>['A', 'B', 'C', 'D', 'E'].map<Widget>((String item) {
+                      return SizedBox(height: 100.0, child: Text(item));
+                    }).toList(),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    // The threshold should be based on the inner ListView's viewportDimension
+    // (300px), NOT the RefreshIndicator's size (600px) or any other widget's.
+    // 300 * 0.25 = 75px threshold. A drag below this should NOT trigger refresh.
+    await tester.fling(find.text('A'), const Offset(0.0, 15.0), 1000.0);
+    await tester.pumpAndSettle();
+    expect(refreshCalled, false);
+
+    // A drag exceeding the viewportDimension-based threshold should trigger.
+    refreshCalled = false;
+    await tester.fling(find.text('A'), const Offset(0.0, 300.0), 1000.0);
+    await tester.pumpAndSettle();
+    expect(refreshCalled, true);
+  });
+
+  // Verifies that a depth==0 scrollable (default predicate) does not trigger
+  // the NestedScrollView-specific code path. This is the common case where
+  // RefreshIndicator wraps a single scrollable with padding.
+  testWidgets('RefreshIndicator with padded SingleChildScrollView uses viewportDimension', (WidgetTester tester) async {
+    refreshCalled = false;
+    tester.view.physicalSize = const Size(300.0, 600.0);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RefreshIndicator(
+          onRefresh: refresh,
+          child: Padding(
+            padding: const EdgeInsets.all(50.0),
+            child: SingleChildScrollView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              child: const SizedBox(height: 100.0, child: Text('Short content')),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    // depth=0, so the NestedScrollView-specific code path should not be triggered.
+    // The threshold is based on the SingleChildScrollView's viewportDimension.
+    await tester.fling(find.text('Short content'), const Offset(0.0, 300.0), 1000.0);
     await tester.pumpAndSettle();
     expect(refreshCalled, true);
   });
